@@ -6,11 +6,14 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 """
 
 import json
+import logging
 import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -64,14 +67,21 @@ def _scan_cron_prompt(prompt: str) -> str:
 
 
 def _origin_from_env() -> Optional[Dict[str, str]]:
-    origin_platform = os.getenv("HERMES_SESSION_PLATFORM")
-    origin_chat_id = os.getenv("HERMES_SESSION_CHAT_ID")
+    from gateway.session_context import get_session_env
+    origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
+    origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if origin_platform and origin_chat_id:
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
+        if thread_id:
+            logger.debug(
+                "Cron origin captured thread_id=%s for %s:%s",
+                thread_id, origin_platform, origin_chat_id,
+            )
         return {
             "platform": origin_platform,
             "chat_id": origin_chat_id,
-            "chat_name": os.getenv("HERMES_SESSION_CHAT_NAME"),
-            "thread_id": os.getenv("HERMES_SESSION_THREAD_ID"),
+            "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
+            "thread_id": thread_id,
         }
     return None
 
@@ -164,12 +174,12 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
         )
 
     # Validate containment after resolution
+    from tools.path_security import validate_within_dir
+
     scripts_dir = get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
-    resolved = (scripts_dir / raw).resolve()
-    try:
-        resolved.relative_to(scripts_dir.resolve())
-    except ValueError:
+    containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
+    if containment_error:
         return (
             f"Script path escapes the scripts directory via traversal: {raw!r}"
         )
@@ -195,6 +205,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
+        "last_delivery_error": job.get("last_delivery_error"),
         "enabled": job.get("enabled", True),
         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
         "paused_at": job.get("paused_at"),
@@ -231,20 +242,20 @@ def cronjob(
 
         if normalized == "create":
             if not schedule:
-                return json.dumps({"success": False, "error": "schedule is required for create"}, indent=2)
+                return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
             if not prompt and not canonical_skills:
-                return json.dumps({"success": False, "error": "create requires either prompt or at least one skill"}, indent=2)
+                return tool_error("create requires either prompt or at least one skill", success=False)
             if prompt:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
-                    return json.dumps({"success": False, "error": scan_error}, indent=2)
+                    return tool_error(scan_error, success=False)
 
             # Validate script path before storing
             if script:
                 script_error = _validate_cron_script_path(script)
                 if script_error:
-                    return json.dumps({"success": False, "error": script_error}, indent=2)
+                    return tool_error(script_error, success=False)
 
             job = create_job(
                 prompt=prompt or "",
@@ -281,7 +292,7 @@ def cronjob(
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
         if not job_id:
-            return json.dumps({"success": False, "error": f"job_id is required for action '{normalized}'"}, indent=2)
+            return tool_error(f"job_id is required for action '{normalized}'", success=False)
 
         job = get_job(job_id)
         if not job:
@@ -293,7 +304,7 @@ def cronjob(
         if normalized == "remove":
             removed = remove_job(job_id)
             if not removed:
-                return json.dumps({"success": False, "error": f"Failed to remove job '{job_id}'"}, indent=2)
+                return tool_error(f"Failed to remove job '{job_id}'", success=False)
             return json.dumps(
                 {
                     "success": True,
@@ -324,7 +335,7 @@ def cronjob(
             if prompt is not None:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
-                    return json.dumps({"success": False, "error": scan_error}, indent=2)
+                    return tool_error(scan_error, success=False)
                 updates["prompt"] = prompt
             if name is not None:
                 updates["name"] = name
@@ -345,7 +356,7 @@ def cronjob(
                 if script:
                     script_error = _validate_cron_script_path(script)
                     if script_error:
-                        return json.dumps({"success": False, "error": script_error}, indent=2)
+                        return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
@@ -361,14 +372,14 @@ def cronjob(
                     updates["state"] = "scheduled"
                     updates["enabled"] = True
             if not updates:
-                return json.dumps({"success": False, "error": "No updates provided."}, indent=2)
+                return tool_error("No updates provided.", success=False)
             updated = update_job(job_id, updates)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
-        return json.dumps({"success": False, "error": f"Unknown cron action '{action}'"}, indent=2)
+        return tool_error(f"Unknown cron action '{action}'", success=False)
 
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)}, indent=2)
+        return tool_error(str(e), success=False)
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +465,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "deliver": {
                 "type": "string",
-                "description": "Delivery target: origin, local, telegram, discord, slack, whatsapp, signal, matrix, mattermost, homeassistant, dingtalk, feishu, wecom, email, sms, or platform:chat_id or platform:chat_id:thread_id for Telegram topics. Examples: 'origin', 'local', 'telegram', 'telegram:-1001234567890:17585', 'discord:#engineering'"
+                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), or platform:chat_id:thread_id for a specific destination. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting."
             },
             "skills": {
                 "type": "array",
@@ -502,7 +513,7 @@ def check_cronjob_requirements() -> bool:
 
 
 # --- Registry ---
-from tools.registry import registry
+from tools.registry import registry, tool_error
 
 registry.register(
     name="cronjob",
